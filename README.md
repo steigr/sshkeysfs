@@ -35,11 +35,11 @@ sudo modprobe fuse
 docker run \
   --rm -ti \
   -p 22:22 \
-  -v /users.yml:/users.yaml \
+  -v /users.yml:/users.yml \
   --env MAP_URI=/users.yml \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-	ssh-reverse-proxy
+  ssh-reverse-proxy
 ```
 
 ### Remote Datasource
@@ -53,15 +53,16 @@ MAP_URI may point to any YAML-File which ruby's `open-uri` may read.
   target: 127.0.0.1:2220
   keys:
   - ssh-rsa ...
+```
 
 ## The problem
 
-In the container-age ssh access to server is unevitable. The SSH-Protocol lacks somthing like
-the HTTP-`Host`-Header which may router requests to some backend machine or container.
+In the container-age ssh access to server is unevitable. The SSH-Protocol lacks something like
+the HTTP-`Host`-Header which may route requests to some backend machine or container.
 
 ## Conventional solutions
 
-There are two ways make something like a reverse-proxy for ssh.
+There are two ways setting up something like a reverse-proxy for ssh.
 
 ### Enlightened client
 
