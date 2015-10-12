@@ -1,0 +1,254 @@
+#!/usr/bin/env ruby
+require "open-uri"
+require "yaml"
+require "rfusefs"
+require "pathname"
+require "date"
+
+class Element
+	attr_reader :file
+	def initialize
+		@type ||= :unknown
+	end
+	def is_file?
+		type == :file
+	end
+	def is_directory?
+		type == :directory
+	end
+	def size
+		read.size
+	end
+	def read
+		"" if is_file?
+	end
+	def contents
+		[] if is_directory?
+	end
+	def type
+		@type
+	end
+end
+
+class SshConfig < Element
+	attr_accessor :user
+	def initialize user
+		@type = :file
+	end
+	def read
+		"Host *\nForwardAgent yes\nStrictHostKeyChecking no\nUserKnownHostsFile /dev/null\nCheckHostIP no\nLogLevel ERROR\n"
+	end
+end
+
+class AuthorizedKeys < Element
+	attr_accessor :user
+	def initialize user
+		@type = :file
+		@user = user
+	end
+	def read
+		user.keys.collect do |key|
+			"command=\"ssh #{user.target}\" #{key}"
+		end.join("\n") + "\n"
+	end
+end
+
+class DotSsh < Element
+	def initialize user
+		@type = :directory
+		@user = user
+	end
+	def contents
+		files.keys
+	end
+	def files
+		@files ||= {
+			"authorized_keys" => AuthorizedKeys.new(@user),
+			"config"          => SshConfig.new(@user),			
+		}
+	end
+	def get(path)
+		return files[path] if contents.include? path
+	end
+end
+
+class User < Element
+	attr_reader :name, :uid, :shell, :home, :gecos, :gid
+	def initialize name, uid, shell: nil, home: nil
+		@type    = :directory
+		@name    = name
+		@gecos   = name
+		@uid     = uid
+		@gid     = uid
+		@home    = home
+		@home  ||= Passwd.defaults(:home_directories).join(name)
+		@shell   = shell
+		@shell ||= Passwd.defaults(:shell) 
+	end
+	def contents
+		[".ssh"]
+	end
+	def size
+		1
+	end
+	def dotssh
+		@dotssh ||= DotSsh.new(self)
+	end
+	def get path
+		dotssh if path == ".ssh" 
+	end
+	def keys
+		Server.users[name]["keys"]
+	end
+	def target
+		Server.users[name]["target"]
+	end
+end
+
+class Passwd < Element
+	class << self
+		def defaults value
+			@defaults ||= {
+				shell: "/bin/ash",
+				home_directories: Server.mounted_at
+			}
+			@defaults[value.to_sym]
+		end
+	end
+	def initialize
+		@type       ||= :file
+		@uid_offset ||= 1000
+	end
+	def uid_of name
+		users[name] || @users["nobody"]
+	end
+	def gid_of name
+		uid_of name
+	end
+	def is_file?
+		true
+	end
+	def read
+		users.collect do |name,user|
+			"#{user.name}:*:#{user.uid}:#{user.gid}:#{user.gecos}:#{user.home}:#{user.shell}"
+		end.join("\n") + "\n"
+	end
+	def users
+		@users ||= { "root" => root,	"nobody" => nobody, "sshd" => sshd }
+		Server.users.keys.each.with_index do |name,ruid|
+			@users[name] ||= User.new(name,(@uid_offset+ruid))
+		end
+		@users
+	end
+	private
+	def root
+		User.new "root",0,shell:"/bin/ash", home:"/root"
+	end
+	def nobody
+		User.new "nobody",65535,shell:"/sbin/nologin",home:"/tmp/nonexistent"
+	end
+	def sshd
+		User.new "sshd",65534,shell:"/sbin/nologin",home:"/tmp/nonexistent"
+	end
+end
+
+class Root < Element
+	def initialize
+		@type = :directory
+	end
+	def contents
+		Server.users.keys + ["passwd"]
+	end
+end
+
+class Server
+	class << self
+		attr_accessor :refreshed_at
+	end
+	class << self
+		def mount dir, file
+			@instance = self.new dir, file
+		end
+		private
+		def instance
+			@instance ||= self.new
+		end
+		def method_missing method, *args, &block
+			instance.send method, *args, &block
+		end
+	end
+	def initialize dir, file
+		@dir  = Pathname.new(dir)
+		@file = file
+	end
+	def mounted_at
+		@dir
+	end
+	def yaml
+		fresh do
+			@yaml = YAML.load(open(@file).read) rescue {}
+		end
+		@yaml
+	end
+	def fresh
+		self.class.refreshed_at ||= Time.now.to_i - 6
+		if self.class.refreshed_at + 5 < Time.now.to_i
+			yield if block_given?
+			self.class.refreshed_at = Time.now.to_i
+		end
+	end
+	def users
+		yaml.collect{|e|[e["name"],e]}.to_h
+	end
+	def get path
+		path = path.split("/")[1..-1]
+		return Root.new if path.nil?
+		name = path.shift
+		name = name.match(/^(?<name>[a-zA-Z0-9._-]+)$/)["name"]
+		return Passwd.new if path.empty? and name == "passwd"
+		if users.keys.include?(name)
+			user = Passwd.new.users[name]
+			return user if path.empty?
+			dir = path.shift
+			if user.contents.include?(dir)
+				dir = user.get(dir)
+				return dir if path.empty?
+				file = path.shift
+				if dir.contents.include? file
+					file = dir.get(file)
+					return file if path.empty?
+				end
+			end
+		end
+	end
+end
+
+class SshKeysFs < FuseFS::FuseDir
+  def contents(path)
+  	Server.get(path).contents
+  end
+  def file? path
+  	Server.get(path).is_file? rescue false
+  end
+  def directory? path
+  	Server.get(path).is_directory? rescue false
+  end
+  def read_file path
+  	element = Server.get(path)
+  	element.read if element.is_file?
+  end
+  def size path
+  	Server.get(path).size
+  end
+end
+
+if __FILE__ == $0
+	require 'rfusefs'
+	dirname, file = ARGV.shift, ARGV.shift
+	puts "Mounting #{file} to #{dirname}"
+	Server.mount dirname, file
+	FuseFS.set_root(SshKeysFs.new)
+	FuseFS.mount_under(dirname,*ARGV)
+	FuseFS.run
+end
+
